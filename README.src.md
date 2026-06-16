@@ -211,15 +211,40 @@ Hermes 不是单靠模型输出工作的，它是一个强工具调用型 agent�
 - system prompt 快照恢复
 - 多进程共享状态
 
+实现方案：
+
+- SQLite 持久化
+- WAL 模式        # 解决的是“并发读写和持久运行”
+- FTS5 全文检索    # 解决的是“历史消息的高性能全文搜索”
+- 每个方法独立 cursor
+- 写入冲突靠应用层 jitter retry，而不是只靠 SQLite busy timeout
+
 ### 5.1 设计特征
 
-这部分代码明显是按“长期运行服务”来打磨的：
+这部分代码明显是按“长期运行服务”来打磨的。
 
-- SQLite WAL
+**并发与持久化**这块，Hermes 采用 SQLite 的 **WAL 模式**（Write-Ahead Logging，预写日志）：
+
+- 写入先追加到 `*.wal` 文件，再由 checkpoint 合并回主库
+- 读写并发优于传统 `DELETE` journal，适合 CLI、gateway、TUI 共享同一个 `state.db`
+- 每隔一段写入会主动做 `wal_checkpoint(TRUNCATE)`，避免 WAL 文件无限增长
+- 对 NFS / SMB / 某些 FUSE 这类不兼容 WAL 的文件系统，自动回退到 `journal_mode=DELETE`
+
+同时它没有完全依赖 SQLite 默认的 busy timeout，而是自己做了写锁竞争处理：
+
 - application-level jitter retry
-- 读写锁竞争规避
+- `BEGIN IMMEDIATE`
+- 遇到 `database is locked` 时随机退避再重试，降低多进程争锁时的 convoy effect
+
+**全文检索**这块，Hermes 用的是 SQLite 的 **FTS5**：
+
 - FTS5 可用性探测
-- 周期性 checkpoint
+- 维护 `messages_fts` 虚拟表作为全文索引
+- 通过 trigger 把 `messages` 表的变更同步到 FTS 表
+- 索引内容不只包含 `content`，还包含 `tool_name` 和 `tool_calls`
+- 额外维护 `messages_fts_trigram`，专门改善 CJK / 子串搜索
+
+如果当前 Python/SQLite 运行时不支持 FTS5，Hermes 会关闭全文检索，但保留核心会话存储能力，避免“搜索坏了导致整个状态层不可用”。
 
 说明作者已经把 CLI、gateway、多进程/多线程并发这类问题真正跑过一轮，不是只写了 happy path。
 
@@ -232,7 +257,7 @@ Hermes 的很多高级能力都靠它：
 - prompt cache 复用
 - gateway 与 CLI 共享状态
 
-如果只把它当“日志数据库”看，会低估这个模块的重要性。
+所以它更像 Hermes 的**会话与检索基础设施**。如果只把它当“日志数据库”看，会低估这个模块的重要性。
 
 ---
 
